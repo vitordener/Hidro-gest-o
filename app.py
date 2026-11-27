@@ -121,6 +121,8 @@ def _500(e):
 def _csrf():
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path.startswith("/api/"):
         tok = session.get("csrf")
+        if not session.get("uid") and request.path != "/api/login" and not tok:
+            return jsonify(error="Faça login para continuar"), 401
         if not tok or not secrets.compare_digest(tok, request.headers.get("X-CSRF-Token", "")):
             return jsonify(error="Sessão inválida. Recarregue a página."), 403
 
@@ -730,9 +732,12 @@ def customers_list():
     extra, par = seller_customer_filter(u)
     where = "1=1" + extra
     if a.get("q"):
-        like = f"%{a['q'].strip()}%"
+        qv = a["q"].strip()
+        like = f"%{qv}%"
+        # só números/pontuação (CPF, CNPJ, telefone): compara pelos dígitos, que é como ficam gravados
+        num = f"%{digits(qv)}%" if digits(qv) and not any(ch.isalpha() for ch in qv) else like
         where += " AND (c.name LIKE ? OR c.doc LIKE ? OR c.phone LIKE ? OR c.whatsapp LIKE ?)"
-        par += [like, like, f"%{digits(a['q'])}%" if digits(a["q"]) else like, like]
+        par += [like, num, num, like]
     rows = q(get_db(), f"SELECT c.id,c.name,c.doc,c.phone,c.whatsapp,c.email,c.address,c.city,c.notes,c.created_at, "
                        f"(SELECT COUNT(*) FROM sales s WHERE s.customer_id=c.id AND s.status='confirmed'"
                        f"{'' if u['role']=='admin' else ' AND s.seller_id='+str(u['id'])}) purchases, "
@@ -810,9 +815,10 @@ def sale_preview():
     if u["role"] == "admin" and d.get("seller_id"):
         seller = q1(db, "SELECT id,name,role FROM users WHERE id=? AND role='vendedor' AND active=1", (d["seller_id"],)) or u
     p = L.build_sale(db, seller, d, u)
-    out = {"gross": p["gross"], "discount": p["discount"], "freight": p["freight"], "install": p["install"], "other": p["other"],
+    out = {"gross": p["gross"], "discount": p["discount"], "items_discount": p["items_discount"],
+           "general_discount": p["general_discount"], "freight": p["freight"], "install": p["install"], "other": p["other"],
            "total": p["total"], "stock_issues": p["stock_issues"], "commission": p["commission"]["amount"],
-           "lines": [{"name": l["name"], "qty": l["qty"], "unit_price": l["unit_price"], "total": l["line_total"],
+           "lines": [{"name": l["name"], "qty": l["qty"], "unit_price": l["unit_price"], "total": l["line_total"], "discount": l["discount"],
                       "components": [{"name": c["name"], "qty": c["qty"]} for c in l["comps"]]} for l in p["lines"]]}
     if u["role"] == "admin":
         out.update(cost_total=p["cost_total"], gross_profit=p["gross_profit"])
@@ -878,7 +884,7 @@ def sale_get(sid):
     db, u = get_db(), cu()
     s_ = sale_visible(db, sid, u)
     admin = u["role"] == "admin"
-    items = q(db, "SELECT id,parent_id,kind,product_id,package_id,name,qty,unit_price,line_total,net_revenue,unit_cost,cost_total FROM sale_items WHERE sale_id=? ORDER BY id", (sid,))
+    items = q(db, "SELECT id,parent_id,kind,product_id,package_id,name,qty,unit_price,line_total,discount,net_revenue,unit_cost,cost_total FROM sale_items WHERE sale_id=? ORDER BY id", (sid,))
     if not admin:
         items = [{k: v for k, v in it.items() if k not in ("unit_cost", "cost_total", "net_revenue")} for it in items]
     cm = q1(db, "SELECT id,kind,amount,status,base,snapshot,created_at,approved_at,paid_at FROM sale_commissions WHERE sale_id=? AND kind='normal'", (sid,))
@@ -1044,8 +1050,11 @@ def goals_put():
     if not sl:
         raise ApiError("Vendedor inválido", field="seller_id")
     with tx(db):
-        db.execute("INSERT INTO goals(seller_id,month,amount) VALUES(?,?,?) ON CONFLICT(seller_id,month) DO UPDATE SET amount=excluded.amount",
-                   (sl["id"], month, amount))
+        if amount == 0:   # meta zerada = sem meta no mês
+            db.execute("DELETE FROM goals WHERE seller_id=? AND month=?", (sl["id"], month))
+        else:
+            db.execute("INSERT INTO goals(seller_id,month,amount) VALUES(?,?,?) ON CONFLICT(seller_id,month) DO UPDATE SET amount=excluded.amount",
+                       (sl["id"], month, amount))
         audit(db, cu(), "meta.definir", "goal", f"{sl['id']}:{month}", {"valor": amount}, ip())
     return jsonify(ok=True)
 

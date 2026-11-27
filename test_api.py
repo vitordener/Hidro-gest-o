@@ -214,6 +214,51 @@ class T(unittest.TestCase):
         with db() as d:
             self.assertEqual(d.execute("SELECT amount FROM sale_commissions WHERE sale_id=?", (r.json["id"],)).fetchone()[0], round(2 * 44900 * 0.05))
 
+    def test_22b_item_discount(self):
+        a, c = admin(), seller()
+        prods = a.get("/api/products").json
+        p1, p2 = [p for p in prods if p["kind"] == "product" and p["sale_price"] >= 10000 and p["stock_qty"] >= 2][:2]
+        gross = p1["sale_price"] + p2["sale_price"]
+        d1, gen = 1000, 500
+        items = [{"type": "product", "product_id": p1["id"], "qty": 1, "discount": d1},
+                 {"type": "product", "product_id": p2["id"], "qty": 1}]
+        r = self.sale(a, items, discount=gen)
+        self.assertEqual(r.status_code, 201, r.json)
+        s = a.get(f"/api/sales/{r.json['id']}").json
+        self.assertEqual(s["subtotal"], gross)
+        self.assertEqual(s["discount"], d1 + gen)          # total = itens + geral
+        self.assertEqual(s["total"], gross - d1 - gen)
+        it = {i["product_id"]: i for i in s["items"]}
+        self.assertEqual(it[p1["id"]]["discount"], d1)
+        self.assertEqual(it[p2["id"]]["discount"], 0)
+        self.assertEqual(sum(i["net_revenue"] for i in s["items"]), gross - d1 - gen)
+        # o desconto do item recai só sobre ele; o geral é rateado entre as linhas
+        self.assertLess(it[p1["id"]]["net_revenue"], p1["sale_price"] - d1 + 1)
+        self.assertGreater(it[p2["id"]]["net_revenue"], p2["sale_price"] - gen)
+        # desconto do item não pode passar do valor do item
+        bad = [{"type": "product", "product_id": p1["id"], "qty": 1, "discount": p1["sale_price"] + 1}]
+        self.assertEqual(self.sale(a, bad).status_code, 400)
+        # limite do vendedor vale para a soma (item + geral)
+        lim = int(gross * 0.05)
+        over = [{"type": "product", "product_id": p1["id"], "qty": 1, "discount": lim},
+                {"type": "product", "product_id": p2["id"], "qty": 1}]
+        self.assertEqual(self.sale(c, over, discount=100).status_code, 403)
+        self.assertEqual(self.sale(c, over).status_code, 201)
+        # desconto em percentual: 10% no item + 2% geral sobre o que sobrou
+        pi = [{"type": "product", "product_id": p1["id"], "qty": 1, "discount_pct": 10},
+              {"type": "product", "product_id": p2["id"], "qty": 1}]
+        r = self.sale(a, pi, discount_pct=2)
+        self.assertEqual(r.status_code, 201, r.json)
+        s = a.get(f"/api/sales/{r.json['id']}").json
+        di = p1["sale_price"] * 10 // 100
+        self.assertEqual({i["product_id"]: i["discount"] for i in s["items"]}[p1["id"]], di)
+        self.assertEqual(s["discount"], di + (gross - di) * 2 // 100)
+        self.assertEqual(self.sale(a, pi, discount_pct=101).status_code, 400)
+        # vendedor: 5% em todos os itens fica dentro do limite de 5%; 6% não
+        allp = lambda n: [{"type": "product", "product_id": p["id"], "qty": 1, "discount_pct": n} for p in (p1, p2)]
+        self.assertEqual(self.sale(c, allp(5)).status_code, 201)
+        self.assertEqual(self.sale(c, allp(6)).status_code, 403)
+
     def test_23_discount_limit_for_seller(self):
         c = seller()
         it = [{"type": "product", "product_id": pid("LIM-CLO"), "qty": 10}]  # 4490,00
@@ -525,6 +570,66 @@ class T(unittest.TestCase):
         r = a.post("/api/customers", {"name": "<img src=x onerror=alert(1)>"})
         self.assertEqual(r.status_code, 201)
         self.assertEqual(a.get(f"/api/customers/{r.json['id']}").json["name"], "<img src=x onerror=alert(1)>")  # escapamento é feito na renderização
+
+    # ---------------------------------------------------------------- correções
+    def preview(self, c, items):
+        r = c.post("/api/sales/preview", {"customer_id": c.get("/api/customers").json[0]["id"], "items": items, "payment_method": "pix"})
+        self.assertEqual(r.status_code, 200, r.json)
+        return r.json
+
+    def test_80_fixed_commission_is_in_reais(self):
+        a = admin()
+        p = pid("ACE-PEN")
+        self.assertEqual(a.put("/api/commission-rules", {"scope": "product", "ref_id": p, "type": "fixed", "value": 5}).status_code, 200)
+        # R$ 5,00 por unidade x 2 = R$ 10,00
+        self.assertEqual(self.preview(a, [{"type": "product", "product_id": p, "qty": 2}])["commission"], 1000)
+        rid = next(r["id"] for r in a.get("/api/commission-rules").json if r["scope"] == "product" and r["ref_id"] == p)
+        self.assertEqual(a.req("delete", f"/api/commission-rules/{rid}").status_code, 200)
+
+    def test_81_package_without_rule_uses_default(self):
+        a = admin()
+        pk = next(p for p in a.get("/api/packages").json if p["active"])
+        item = [{"type": "package", "package_id": pk["id"], "qty": 1}]
+        with db() as d:
+            saved = d.execute("SELECT active FROM commission_rules WHERE scope='package' AND ref_id=?", (pk["id"],)).fetchone()
+            d.execute("UPDATE commission_rules SET active=0 WHERE scope='package' AND ref_id=?", (pk["id"],))
+            dflt = d.execute("SELECT type,value FROM commission_rules WHERE scope='default'").fetchone()
+        try:
+            self.assertEqual(dflt["type"], "percent")
+            self.assertEqual(self.preview(a, item)["commission"], round(pk["sale_price"] * dflt["value"] / 100))
+        finally:
+            if saved:
+                with db() as d:
+                    d.execute("UPDATE commission_rules SET active=? WHERE scope='package' AND ref_id=?", (saved[0], pk["id"]))
+
+    def test_82_zero_goal(self):
+        a = admin()
+        sid = a.get("/api/sellers").json[0]["id"]
+        url = "/api/reports/goals?from=2032-01-01&to=2032-03-31"
+        # meta zerada pela tela remove a meta
+        self.assertEqual(a.put("/api/goals", {"seller_id": sid, "month": "2032-01", "amount": 500000}).status_code, 200)
+        self.assertEqual(a.put("/api/goals", {"seller_id": sid, "month": "2032-01", "amount": 0}).status_code, 200)
+        with db() as d:
+            self.assertIsNone(d.execute("SELECT 1 FROM goals WHERE seller_id=? AND month='2032-01'", (sid,)).fetchone())
+            # meta 0 gravada por versão anterior não pode derrubar o relatório
+            d.execute("INSERT INTO goals(seller_id,month,amount) VALUES(?,?,0)", (sid, "2032-02"))
+        try:
+            self.assertEqual(a.get(url).status_code, 200)
+        finally:
+            with db() as d:
+                d.execute("DELETE FROM goals WHERE seller_id=? AND month='2032-02'", (sid,))
+
+    def test_83_customer_search_by_formatted_doc(self):
+        a = admin()
+        r = a.post("/api/customers", {"name": "Busca Formatada", "doc": "390.533.447-05", "phone": "(19) 97777-1234"})
+        self.assertEqual(r.status_code, 201, r.json)
+        for term in ("390.533.447-05", "39053344705", "(19) 97777-1234", "Busca Format"):
+            ids = [c["id"] for c in a.get("/api/customers?q=" + term.replace(" ", "%20")).json]
+            self.assertIn(r.json["id"], ids, term)
+
+    def test_84_expired_session_write_asks_for_login(self):
+        c = A.app.test_client()   # sem sessão nenhuma, como um cookie expirado
+        self.assertEqual(c.post("/api/sales/preview", json={}).status_code, 401)
 
 
 if __name__ == "__main__":

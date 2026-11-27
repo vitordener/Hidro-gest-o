@@ -291,7 +291,7 @@ def rep_goals(db, a):
             if sm["goal"] is None and not sm["count"]:
                 continue
             rows.append({"month": mo, "seller": u["name"], "goal": sm["goal"] or 0, "sold": sm["sold"], "count": sm["count"], "pct": sm["pct"] or 0,
-                         "status": "Sem meta" if sm["goal"] is None else ("Atingida" if sm["pct"] >= 100 else "Pendente")})
+                         "status": "Sem meta" if sm["goal"] is None else ("Atingida" if (sm["pct"] or 0) >= 100 else "Pendente")})
     return _wrap("goals", "Metas e desempenho", a, [C("month", "Mês"), C("seller", "Vendedor"), C("goal", "Meta", "money"), C("sold", "Vendido", "money"),
                  C("count", "Vendas", "int"), C("pct", "% da meta", "pct"), C("status", "Situação")], rows, ("goal", "sold", "count"))
 

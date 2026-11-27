@@ -193,6 +193,10 @@ input.err,select.err{border-color:var(--bad)}
 .qty{display:inline-flex;align-items:center;border:1.5px solid var(--line);border-radius:10px;overflow:hidden}
 .qty button{border:0;background:var(--b50);width:30px;height:32px;cursor:pointer;font-weight:800;color:var(--b800)}
 .qty input{width:62px;border:0;border-radius:0;text-align:center;padding:6px 2px}
+#cart .li{flex-wrap:wrap}
+#cart .li>.grow{min-width:140px}
+.idisc{display:flex;align-items:center;gap:6px}
+.idisc input{width:92px;padding:6px 8px;text-align:right}
 .sum-row{display:flex;justify-content:space-between;padding:6px 0;gap:12px}
 .sum-total{font-size:28px;font-weight:900;color:var(--b800)}
 .warnbox{background:var(--warnbg);color:#7a4e0a;border-radius:12px;padding:10px 12px;font-size:13px;font-weight:600}

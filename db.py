@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS sale_items(
   qty REAL NOT NULL,
   unit_price INTEGER NOT NULL DEFAULT 0,
   line_total INTEGER NOT NULL DEFAULT 0,
+  discount INTEGER NOT NULL DEFAULT 0,
   net_revenue INTEGER NOT NULL DEFAULT 0,
   unit_cost INTEGER NOT NULL DEFAULT 0,
   cost_total INTEGER NOT NULL DEFAULT 0
@@ -310,6 +311,9 @@ def init_db(db=None, admin_email=None, admin_password=None):
     own = db is None
     db = db or connect()
     db.executescript(SCHEMA)
+    # migração: bancos criados antes do desconto por item não têm a coluna
+    if "discount" not in [r[1] for r in db.execute("PRAGMA table_info(sale_items)")]:
+        db.execute("ALTER TABLE sale_items ADD COLUMN discount INTEGER NOT NULL DEFAULT 0")
     for k, v in DEFAULT_SETTINGS.items():
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
     for name in CATEGORIES:

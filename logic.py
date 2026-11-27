@@ -114,7 +114,7 @@ def calc_amount(rule, base, qty):
         return 0
     if rule["type"] == "percent":
         return rnd(base * rule["value"] / 100.0)
-    return rnd(rule["value"] * qty)  # fixa = valor (centavos) por unidade
+    return rnd(rule["value"] * 100 * qty)  # fixa = valor em reais por unidade -> centavos
 
 
 # ---------------------------------------------------------------- venda
@@ -151,6 +151,24 @@ def build_sale(db, seller, payload, actor):
     rev_lines = []   # linhas que geram receita (produto avulso ou cabeçalho de pacote)
     need = {}        # product_id -> quantidade física a baixar
 
+    def pct_of(v, amount):
+        """Desconto em % -> centavos (arredonda para baixo, para a soma nunca passar do limite do vendedor)."""
+        try:
+            pct = float(v)
+        except (TypeError, ValueError):
+            raise ApiError("Percentual de desconto inválido", field="discount")
+        if not 0 <= pct <= 100:
+            raise ApiError("Percentual de desconto deve ficar entre 0 e 100", field="discount")
+        return math.floor(amount * pct / 100.0 + 1e-9)
+
+    def line_disc(it, line_total):
+        if it.get("discount_pct"):
+            return pct_of(it["discount_pct"], line_total)
+        d = to_int(it.get("discount") or 0, "desconto do item")
+        if d > line_total:
+            raise ApiError("Desconto do item maior que o valor do item", field="discount")
+        return d
+
     def need_add(p, qty):
         if p["kind"] == "product":
             need[p["id"]] = round(need.get(p["id"], 0) + qty, 3)
@@ -160,10 +178,11 @@ def build_sale(db, seller, payload, actor):
         if t == "product":
             p = getp(it.get("product_id"))
             qty = to_qty(it.get("qty"))
+            lt = rnd(qty * p["sale_price"])
             rev_lines.append({
                 "kind": "product", "product": p, "name": p["name"], "qty": qty,
                 "unit_price": p["sale_price"], "unit_cost": p["cost_price"],
-                "line_total": rnd(qty * p["sale_price"]), "cost_total": rnd(qty * p["cost_price"]),
+                "line_total": lt, "discount": line_disc(it, lt), "cost_total": rnd(qty * p["cost_price"]),
                 "comps": [],
             })
             need_add(p, qty)
@@ -200,6 +219,7 @@ def build_sale(db, seller, payload, actor):
             rev_lines.append({
                 "kind": "package", "package": pkg, "name": pkg["name"], "qty": pq,
                 "unit_price": price, "unit_cost": cost_unit, "line_total": price * pq,
+                "discount": line_disc(it, price * pq),
                 "cost_total": sum(c["cost_total"] for c in comps), "comps": comps,
             })
             extras = it.get("extras") or []
@@ -208,10 +228,11 @@ def build_sale(db, seller, payload, actor):
             for ex in extras:
                 p = getp(ex.get("product_id"))
                 qty = to_qty(ex.get("qty"))
+                lt = rnd(qty * p["sale_price"])
                 rev_lines.append({
                     "kind": "product", "product": p, "name": p["name"] + " (adicional)", "qty": qty,
                     "unit_price": p["sale_price"], "unit_cost": p["cost_price"],
-                    "line_total": rnd(qty * p["sale_price"]), "cost_total": rnd(qty * p["cost_price"]),
+                    "line_total": lt, "discount": line_disc(ex, lt), "cost_total": rnd(qty * p["cost_price"]),
                     "comps": [],
                 })
                 need_add(p, qty)
@@ -219,15 +240,23 @@ def build_sale(db, seller, payload, actor):
             raise ApiError("Tipo de item inválido")
 
     gross = sum(l["line_total"] for l in rev_lines)
-    discount = to_int(payload.get("discount", 0), "desconto")
-    if discount > gross:
+    # desconto: por item (já em cada linha) + geral sobre o total; `discount` é a soma dos dois
+    items_discount = sum(l["discount"] for l in rev_lines)
+    if payload.get("discount_pct"):
+        general_discount = pct_of(payload["discount_pct"], gross - items_discount)
+    else:
+        general_discount = to_int(payload.get("discount") or 0, "desconto")
+    if general_discount > gross - items_discount:
         raise ApiError("Desconto maior que o valor dos itens", field="discount")
+    discount = items_discount + general_discount
     if actor["role"] != "admin":
         lim = float(st.get("seller_max_discount_pct", 0) or 0)
         if discount > math.floor(gross * lim / 100.0):
-            raise ApiError(f"Desconto acima do limite autorizado ({lim:g}%). Solicite ao administrador.", 403, "discount")
+            raise ApiError(f"Desconto acima do limite autorizado ({lim:g}% dos itens, somando descontos por item e geral). "
+                           "Solicite ao administrador.", 403, "discount")
     net_items = gross - discount
-    nets = allocate(net_items, [l["line_total"] for l in rev_lines])
+    # o desconto geral é rateado pelo valor de cada linha já com o desconto do próprio item
+    nets = allocate(net_items, [l["line_total"] - l["discount"] for l in rev_lines])
     for l, n in zip(rev_lines, nets):
         l["net"] = n
 
@@ -254,13 +283,14 @@ def build_sale(db, seller, payload, actor):
             amount = calc_amount(rule, base, l["qty"])
             src = None if not rule else rule["scope"]
         else:
-            rule = q1(db, "SELECT * FROM commission_rules WHERE scope='package' AND ref_id=? AND active=1", (l["package"]["id"],))
+            rule = (q1(db, "SELECT * FROM commission_rules WHERE scope='package' AND ref_id=? AND active=1", (l["package"]["id"],))
+                    or q1(db, "SELECT * FROM commission_rules WHERE scope='default' AND ref_id=0 AND active=1"))
             if rule and rule["base"] == "eligible":
                 base = sum(c["net"] for c in l["comps"] if c["eligible"])
             else:
                 base = l["net"]
             amount = calc_amount(rule, base, l["qty"])
-            src = "package" if rule else None
+            src = rule["scope"] if rule else None
         comm_base += base if rule else 0
         comm_total += amount
         comm_lines.append({
@@ -286,6 +316,7 @@ def build_sale(db, seller, payload, actor):
     cost_total = sum(l["cost_total"] for l in rev_lines)
     return {
         "customer": cust, "lines": rev_lines, "need": need, "gross": gross, "discount": discount,
+        "items_discount": items_discount, "general_discount": general_discount,
         "freight": freight, "install": install, "other": other, "total": total,
         "cost_total": cost_total, "gross_profit": total - cost_total,
         "costs_confirmed": 0 if (freight + install + other) > 0 else 1,
@@ -335,15 +366,15 @@ def commit_sale(db, plan, seller, actor, idem_key=None, created_at=None, allow_o
     for l in plan["lines"]:
         if l["kind"] == "product":
             db.execute(
-                "INSERT INTO sale_items(sale_id,kind,product_id,name,qty,unit_price,line_total,net_revenue,unit_cost,cost_total) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (sid, "product", l["product"]["id"], l["name"], l["qty"], l["unit_price"], l["line_total"], l["net"],
+                "INSERT INTO sale_items(sale_id,kind,product_id,name,qty,unit_price,line_total,discount,net_revenue,unit_cost,cost_total) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, "product", l["product"]["id"], l["name"], l["qty"], l["unit_price"], l["line_total"], l["discount"], l["net"],
                  l["unit_cost"], l["cost_total"]))
         else:
             pid = db.execute(
-                "INSERT INTO sale_items(sale_id,kind,package_id,name,qty,unit_price,line_total,net_revenue,unit_cost,cost_total) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (sid, "package", l["package"]["id"], l["name"], l["qty"], l["unit_price"], l["line_total"], l["net"],
+                "INSERT INTO sale_items(sale_id,kind,package_id,name,qty,unit_price,line_total,discount,net_revenue,unit_cost,cost_total) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, "package", l["package"]["id"], l["name"], l["qty"], l["unit_price"], l["line_total"], l["discount"], l["net"],
                  l["unit_cost"], l["cost_total"])).lastrowid
             for c in l["comps"]:
                 db.execute(

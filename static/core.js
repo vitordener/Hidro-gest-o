@@ -224,6 +224,7 @@ function showLogin(msg) {
   $('#loginf').addEventListener('submit', async ev => {
     ev.preventDefault(); const b = $('#lb'); b.disabled = true; $('#lerr').hidden = true;
     try {
+      S.csrf = (await GET('/api/me')).csrf;   // a sessão pode ter expirado: pega um token novo
       const d = await POST('/api/login', { email: $('#le').value, password: $('#lp').value });
       applyMe(d); startApp();
     } catch (e) { $('#lerr').textContent = e.message; $('#lerr').hidden = false; b.disabled = false; $('#lp').select(); }
@@ -321,23 +322,25 @@ const progBar = p => `<div class="prog ${p >= 100 ? 'done' : ''}"><i style="widt
 
 function receiptHTML(s) {
   const comps = id => s.items.filter(i => i.parent_id === id);
-  const rows = s.items.filter(i => i.kind !== 'component').map(i => `<tr><td>${esc(i.name)}${i.kind === 'package' ? `<div style="font-size:11px;color:#444">Inclui: ${comps(i.id).map(c => `${esc(c.name)} (${num(c.qty)})`).join(', ')}</div>` : ''}</td><td class="num">${num(i.qty)}</td><td class="num">${brl(i.unit_price)}</td><td class="num">${brl(i.line_total)}</td></tr>`).join('');
+  const idisc = s.items.reduce((a, i) => a + (i.discount || 0), 0), gdisc = s.discount - idisc;
+  const rows = s.items.filter(i => i.kind !== 'component').map(i => `<tr><td>${esc(i.name)}${i.kind === 'package' ? `<div style="font-size:11px;color:#444">Inclui: ${comps(i.id).map(c => `${esc(c.name)} (${num(c.qty)})`).join(', ')}</div>` : ''}</td><td class="num">${num(i.qty)}</td><td class="num">${brl(i.unit_price)}</td>${idisc ? `<td class="num">${i.discount ? '- ' + brl(i.discount) : ''}</td>` : ''}<td class="num">${brl(i.line_total - (i.discount || 0))}</td></tr>`).join('');
   const st = s.store || {};
   return `<div class="rcpt"><div class="hd">${st.logo ? `<img src="${esc(st.logo)}" alt="">` : ''}<div><h1>${esc(st.store_name || '')}</h1><div>${esc(st.store_tagline || '')}</div></div><div style="margin-left:auto;text-align:right"><b>COMPROVANTE DE VENDA</b><div>Nº ${esc(s.number)}</div><div>${fmtDT(s.created_at)}</div>${s.status !== 'confirmed' ? `<div><b>${esc(SALE_ST[s.status][0].toUpperCase())}</b></div>` : ''}</div></div>
   <p><b>Cliente:</b> ${esc(s.customer?.name)} ${s.customer?.doc ? '· CPF/CNPJ ' + esc(s.customer.doc) : ''}<br>${s.customer?.phone ? 'Tel: ' + esc(s.customer.phone) + ' · ' : ''}${esc([s.customer?.address, s.customer?.city].filter(Boolean).join(' — '))}<br><b>Vendedor:</b> ${esc(s.seller_name)}</p>
-  <table><thead><tr><th>Item</th><th class="num">Qtd.</th><th class="num">Unitário</th><th class="num">Total</th></tr></thead><tbody>${rows}</tbody></table>
-  <table style="margin-top:8px"><tbody><tr><td>Subtotal</td><td class="num">${brl(s.subtotal)}</td></tr>${s.discount ? `<tr><td>Desconto</td><td class="num">- ${brl(s.discount)}</td></tr>` : ''}${s.freight ? `<tr><td>Frete</td><td class="num">${brl(s.freight)}</td></tr>` : ''}${s.install ? `<tr><td>Instalação</td><td class="num">${brl(s.install)}</td></tr>` : ''}${s.other ? `<tr><td>Outros serviços</td><td class="num">${brl(s.other)}</td></tr>` : ''}<tr><td><b>TOTAL</b></td><td class="num"><b>${brl(s.total)}</b></td></tr></tbody></table>
+  <table><thead><tr><th>Item</th><th class="num">Qtd.</th><th class="num">Unitário</th>${idisc ? '<th class="num">Desconto</th>' : ''}<th class="num">Total</th></tr></thead><tbody>${rows}</tbody></table>
+  <table style="margin-top:8px"><tbody><tr><td>Subtotal</td><td class="num">${brl(s.subtotal)}</td></tr>${idisc ? `<tr><td>Desconto nos itens</td><td class="num">- ${brl(idisc)}</td></tr>` : ''}${gdisc ? `<tr><td>${idisc ? 'Desconto geral' : 'Desconto'}</td><td class="num">- ${brl(gdisc)}</td></tr>` : ''}${s.freight ? `<tr><td>Frete</td><td class="num">${brl(s.freight)}</td></tr>` : ''}${s.install ? `<tr><td>Instalação</td><td class="num">${brl(s.install)}</td></tr>` : ''}${s.other ? `<tr><td>Outros serviços</td><td class="num">${brl(s.other)}</td></tr>` : ''}<tr><td><b>TOTAL</b></td><td class="num"><b>${brl(s.total)}</b></td></tr></tbody></table>
   <p><b>Pagamento:</b> ${esc(PAY_LBL[s.payment_method] || s.payment_method)}${s.installments > 1 ? ` em ${s.installments}x` : ''}${s.down_payment ? ` · entrada de ${brl(s.down_payment)}` : ''}</p>${s.notes ? `<p><b>Observações:</b> ${esc(s.notes)}</p>` : ''}
   <div class="sig"><div>Cliente</div><div>${esc(st.store_name || 'Loja')}</div></div></div>`;
 }
 async function openSale(id, onChange) {
   const s = await GET('/api/sales/' + id), admin = S.user.role === 'admin';
   const comps = pid => s.items.filter(i => i.parent_id === pid);
-  const items = s.items.filter(i => i.kind !== 'component').map(i => `<tr><td>${esc(i.name)}${i.kind === 'package' ? `<div class="xs muted">${comps(i.id).map(c => esc(c.name) + ' ×' + num(c.qty)).join(' · ')}</div>` : ''}</td><td class="num">${num(i.qty)}</td><td class="num">${brl(i.unit_price)}</td><td class="num">${brl(i.line_total)}</td>${admin ? `<td class="num">${brl(i.cost_total)}</td>` : ''}</tr>`).join('');
+  const idisc = s.items.reduce((a, i) => a + (i.discount || 0), 0);
+  const items = s.items.filter(i => i.kind !== 'component').map(i => `<tr><td>${esc(i.name)}${i.kind === 'package' ? `<div class="xs muted">${comps(i.id).map(c => esc(c.name) + ' ×' + num(c.qty)).join(' · ')}</div>` : ''}</td><td class="num">${num(i.qty)}</td><td class="num">${brl(i.unit_price)}</td>${idisc ? `<td class="num">${i.discount ? '− ' + brl(i.discount) : ''}</td>` : ''}<td class="num">${brl(i.line_total - (i.discount || 0))}</td>${admin ? `<td class="num">${brl(i.cost_total)}</td>` : ''}</tr>`).join('');
   const cm = s.commission;
   const body = `<div class="row between mb"><div><b>${esc(s.number)}</b> ${badge(SALE_ST, s.status)}<div class="sm muted">${fmtDT(s.created_at)} · Vendedor: ${esc(s.seller_name)}</div></div><div class="sm"><b>${esc(s.customer.name)}</b><br>${esc(s.customer.phone || '')}</div></div>
-  <div class="tw"><table><thead><tr><th>Item</th><th class="num">Qtd.</th><th class="num">Unit.</th><th class="num">Total</th>${admin ? '<th class="num">Custo</th>' : ''}</tr></thead><tbody>${items}</tbody></table></div>
-  <div class="grid g2 mt"><div class="stat"><div class="l">Total</div><div class="v">${brl(s.total)}</div><div class="s">Itens ${brl(s.subtotal)} − desconto ${brl(s.discount)} + frete/instalação/outros ${brl(s.freight + s.install + s.other)}</div></div>
+  <div class="tw"><table><thead><tr><th>Item</th><th class="num">Qtd.</th><th class="num">Unit.</th>${idisc ? '<th class="num">Desc.</th>' : ''}<th class="num">Total</th>${admin ? '<th class="num">Custo</th>' : ''}</tr></thead><tbody>${items}</tbody></table></div>
+  <div class="grid g2 mt"><div class="stat"><div class="l">Total</div><div class="v">${brl(s.total)}</div><div class="s">Itens ${brl(s.subtotal)} − desconto ${brl(s.discount)}${idisc ? ` (${brl(idisc)} nos itens${s.discount - idisc ? ` + ${brl(s.discount - idisc)} geral` : ''})` : ''} + frete/instalação/outros ${brl(s.freight + s.install + s.other)}</div></div>
   <div class="stat"><div class="l">Pagamento</div><div class="v" style="font-size:17px">${esc(PAY_LBL[s.payment_method] || s.payment_method)}${s.installments > 1 ? ` · ${s.installments}x` : ''}</div><div class="s">${s.down_payment ? 'Entrada ' + brl(s.down_payment) : ''}</div></div>
   ${cm ? `<div class="stat"><div class="l">Comissão</div><div class="v">${brl(cm.amount)}</div><div class="s">${badge(COMM_ST, cm.status)}</div></div>` : ''}
   ${admin ? `<div class="stat"><div class="l">Lucro bruto estimado</div><div class="v">${brl(s.gross_profit)}</div><div class="s">Custos ${brl(s.cost_total + s.freight_cost + s.install_cost + s.other_cost)} ${s.costs_confirmed ? '' : '· <span class="warn b">frete/instalação a confirmar</span>'}</div></div>` : ''}</div>
